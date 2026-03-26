@@ -1,13 +1,12 @@
 """
-handlers/lists.py — хендлеры для работы со списками.
+handlers/lists.py — хендлеры для работы со списками (с поддержкой иерархии).
 
-Ключевые изменения по сравнению с первой версией:
-  1. callback.answer() вызывается В НАЧАЛЕ хендлера — Telegram сразу получает
-     подтверждение и не показывает "часики". Потом можно делать любые запросы к БД.
-  2. Список отображается как текст сообщения (format_items_text),
-     а не как кнопки — текст не обрезается.
-  3. Редактирование и удаление — через выбор номера пункта (numbers_keyboard),
-     а не отдельные кнопки у каждого пункта.
+Навигация:
+  /lists                 → корневые категории
+  cat:open:{id}          → открыть узел (папки + пункты)
+  cat:new:root           → создать корневую категорию
+  cat:new:{parent_id}    → создать вложенную категорию
+  cat:list               → вернуться к корневым категориям
 """
 
 from aiogram import Router, F
@@ -21,39 +20,28 @@ from db.models import User
 from services import ListService
 from handlers.keyboards import (
     categories_keyboard,
-    category_keyboard,
+    node_keyboard,
     confirm_keyboard,
     back_keyboard,
     numbers_keyboard,
-    format_items_text,
+    format_node_text,
 )
 
 router = Router()
 
 
-# ── FSM States ────────────────────────────────────────────────────────────────
-
 class ListStates(StatesGroup):
-    waiting_for_category_name = State()
-    waiting_for_item_text = State()
-    waiting_for_item_edit = State()   # ждём новый текст (после выбора номера)
+    waiting_for_category_name = State()  # данные: parent_id (None = корень)
+    waiting_for_item_text = State()      # данные: category_id
+    waiting_for_item_edit = State()      # данные: item_id
 
 
 # ── Вспомогательная функция ───────────────────────────────────────────────────
 
-async def _show_category(
-    target,  # Message или CallbackQuery
-    user: User,
-    session: AsyncSession,
-    category_id: int,
-    prefix: str = "",
-):
-    """
-    Показывает/обновляет содержимое категории.
-    Используется из многих хендлеров — вынесено чтобы не дублировать.
-    """
+async def _show_node(target, user: User, session: AsyncSession, category_id: int, prefix: str = ""):
+    """Показывает/обновляет содержимое узла дерева."""
     list_service = ListService(session)
-    result = await list_service.get_items(user, category_id)
+    result = await list_service.get_node(user, category_id)
 
     if not result.success:
         if isinstance(target, CallbackQuery):
@@ -62,10 +50,31 @@ async def _show_category(
             await target.answer(result.message)
         return
 
-    text = (prefix + "\n\n" if prefix else "") + format_items_text(
-        result.category, result.items
+    text = (prefix + "\n\n" if prefix else "") + format_node_text(
+        result.breadcrumb, result.children, result.items
     )
-    keyboard = category_keyboard(result.category, result.items)
+    keyboard = node_keyboard(result.category, result.children, result.items)
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def _show_root(target, user: User, session: AsyncSession, prefix: str = ""):
+    """Показывает главное меню со списком корневых категорий."""
+    list_service = ListService(session)
+    result = await list_service.get_root_categories(user)
+
+    if not result.success:
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(result.message)
+        else:
+            await target.answer(result.message)
+        return
+
+    text = (prefix + "\n\n" if prefix else "") + "📋 <b>Твои списки:</b>"
+    keyboard = categories_keyboard(result.categories)
 
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -77,69 +86,46 @@ async def _show_category(
 
 @router.message(Command("lists"))
 async def cmd_lists(message: Message, user: User, session: AsyncSession):
-    list_service = ListService(session)
-    result = await list_service.get_categories(user)
+    await _show_root(message, user, session)
 
-    if not result.success:
-        await message.answer(result.message)
-        return
-
-    if not result.categories:
-        await message.answer(
-            "У тебя пока нет списков.\nНажми кнопку ниже чтобы создать первый!",
-            reply_markup=categories_keyboard([]),
-        )
-        return
-
-    await message.answer(
-        "📋 <b>Твои списки:</b>",
-        reply_markup=categories_keyboard(result.categories),
-        parse_mode="HTML",
-    )
-
-
-# ── Навигация по категориям ───────────────────────────────────────────────────
 
 @router.callback_query(F.data == "cat:list")
-async def cb_categories_list(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
-    await callback.answer()  # ← сразу, до запросов к БД
-    list_service = ListService(session)
-    result = await list_service.get_categories(user)
+async def cb_root(callback: CallbackQuery, user: User, session: AsyncSession):
+    await callback.answer()
+    await _show_root(callback, user, session)
 
-    if not result.success:
-        await callback.message.edit_text(result.message)
-        return
 
-    await callback.message.edit_text(
-        "📋 <b>Твои списки:</b>",
-        reply_markup=categories_keyboard(result.categories or []),
-        parse_mode="HTML",
-    )
-
+# ── Открыть узел ──────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("cat:open:"))
-async def cb_category_open(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
-    await callback.answer()  # ← сразу
+async def cb_node_open(callback: CallbackQuery, user: User, session: AsyncSession):
+    await callback.answer()
     category_id = int(callback.data.split(":")[2])
-    await _show_category(callback, user, session, category_id)
+    await _show_node(callback, user, session, category_id)
 
 
 # ── Создание категории ────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "cat:new")
+@router.callback_query(F.data.startswith("cat:new:"))
 async def cb_category_new(callback: CallbackQuery, state: FSMContext):
+    """
+    cat:new:root      → создаём корневую
+    cat:new:{int}     → создаём дочернюю внутри {int}
+    """
     await callback.answer()
-    await callback.message.edit_text(
-        "Введи название категории.\n\n"
-        "Можно добавить эмодзи в начало: <code>🛒 Продукты</code>\n"
-        "Или просто: <code>Фильмы</code>",
-        parse_mode="HTML",
-        reply_markup=back_keyboard("cat:list"),
-    )
+    raw = callback.data.split(":")[2]
+    parent_id = None if raw == "root" else int(raw)
+
+    await state.update_data(parent_id=parent_id)
+
+    if parent_id:
+        hint = "Введи название нового раздела внутри текущего.\n\nМожно с эмодзи: <code>🎬 Фэнтези</code>"
+        back_cb = f"cat:open:{parent_id}"
+    else:
+        hint = "Введи название нового раздела.\n\nМожно с эмодзи: <code>🛒 Продукты</code>"
+        back_cb = "cat:list"
+
+    await callback.message.edit_text(hint, parse_mode="HTML", reply_markup=back_keyboard(back_cb))
     await state.set_state(ListStates.waiting_for_category_name)
 
 
@@ -152,28 +138,32 @@ async def handle_category_name(
         await message.answer("Название должно быть от 1 до 60 символов. Попробуй ещё раз:")
         return
 
-    emoji = None
-    name = text
+    # Парсим эмодзи из начала строки
+    emoji, name = None, text
     if text and not text[0].isalnum() and not text[0].isspace():
         parts = text.split(maxsplit=1)
         if len(parts) == 2:
-            emoji = parts[0]
-            name = parts[1]
+            emoji, name = parts[0], parts[1]
+
+    data = await state.get_data()
+    parent_id = data.get("parent_id")
+    await state.clear()
 
     list_service = ListService(session)
-    result = await list_service.create_category(user, name, emoji)
-    await state.clear()
+    if parent_id:
+        result = await list_service.create_subcategory(user, parent_id, name, emoji)
+    else:
+        result = await list_service.create_root_category(user, name, emoji)
 
     if not result.success:
         await message.answer(result.message)
         return
 
-    categories_result = await list_service.get_categories(user)
-    await message.answer(
-        f"✅ {result.message}\n\n📋 <b>Твои списки:</b>",
-        reply_markup=categories_keyboard(categories_result.categories or []),
-        parse_mode="HTML",
-    )
+    # После создания возвращаемся туда откуда пришли
+    if parent_id:
+        await _show_node(message, user, session, parent_id, prefix="✅ Раздел создан!")
+    else:
+        await _show_root(message, user, session, prefix="✅ Раздел создан!")
 
 
 # ── Удаление категории ────────────────────────────────────────────────────────
@@ -183,7 +173,9 @@ async def cb_category_delete(callback: CallbackQuery):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
     await callback.message.edit_text(
-        "⚠️ Удалить категорию и все её пункты?",
+        "⚠️ Удалить этот раздел?\n\n"
+        "<i>Все вложенные разделы и пункты тоже будут удалены.</i>",
+        parse_mode="HTML",
         reply_markup=confirm_keyboard("cat_del", category_id),
     )
 
@@ -194,6 +186,12 @@ async def cb_category_delete_confirm(
 ):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
+
+    # Запомним parent_id ДО удаления
+    from repositories import ListRepository
+    cat = await ListRepository(session).get_category(category_id)
+    parent_id = cat.parent_id if cat else None
+
     list_service = ListService(session)
     result = await list_service.delete_category(user, category_id)
 
@@ -201,12 +199,11 @@ async def cb_category_delete_confirm(
         await callback.message.edit_text(result.message)
         return
 
-    categories_result = await list_service.get_categories(user)
-    await callback.message.edit_text(
-        f"✅ {result.message}\n\n📋 <b>Твои списки:</b>",
-        reply_markup=categories_keyboard(categories_result.categories or []),
-        parse_mode="HTML",
-    )
+    # Возвращаемся к родителю или в корень
+    if parent_id:
+        await _show_node(callback, user, session, parent_id, prefix="✅ Удалено.")
+    else:
+        await _show_root(callback, user, session, prefix="✅ Удалено.")
 
 
 @router.callback_query(F.data.startswith("cat_del:cancel:"))
@@ -215,7 +212,7 @@ async def cb_category_delete_cancel(
 ):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
-    await _show_category(callback, user, session, category_id)
+    await _show_node(callback, user, session, category_id)
 
 
 # ── Добавление пункта ─────────────────────────────────────────────────────────
@@ -238,30 +235,28 @@ async def handle_item_text(
 ):
     data = await state.get_data()
     category_id = data["category_id"]
-
     text = message.text.strip()
+
     if not text or len(text) > 500:
         await message.answer("Текст должен быть от 1 до 500 символов. Попробуй ещё раз:")
         return
 
     list_service = ListService(session)
-    add_result = await list_service.add_item(user, category_id, text)
+    result = await list_service.add_item(user, category_id, text)
     await state.clear()
 
-    if not add_result.success:
-        await message.answer(add_result.message)
+    if not result.success:
+        await message.answer(result.message)
         return
 
-    await _show_category(message, user, session, category_id, prefix="✅ Добавлено!")
+    await _show_node(message, user, session, category_id, prefix="✅ Добавлено!")
 
 
-# ── Toggle (отметить по номеру) ───────────────────────────────────────────────
+# ── Toggle ────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("item:toggle:"))
-async def cb_item_toggle(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
-    await callback.answer()  # ← сразу — убирает "часики"
+async def cb_item_toggle(callback: CallbackQuery, user: User, session: AsyncSession):
+    await callback.answer()
     item_id = int(callback.data.split(":")[2])
     list_service = ListService(session)
     result = await list_service.toggle_item(user, item_id)
@@ -269,25 +264,22 @@ async def cb_item_toggle(
     if not result.success:
         return
 
-    await _show_category(callback, user, session, result.item.category_id)
+    await _show_node(callback, user, session, result.item.category_id)
 
 
-# ── Редактирование: выбор пункта ──────────────────────────────────────────────
+# ── Редактирование ────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("item:edit_ask:"))
-async def cb_item_edit_ask(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
-    """Показываем пронумерованные кнопки — пользователь выбирает какой пункт редактировать."""
+async def cb_item_edit_ask(callback: CallbackQuery, user: User, session: AsyncSession):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
     list_service = ListService(session)
-    result = await list_service.get_items(user, category_id)
+    result = await list_service.get_node(user, category_id)
 
     if not result.success or not result.items:
         return
 
-    text = format_items_text(result.category, result.items)
+    text = format_node_text(result.breadcrumb, result.children, result.items)
     await callback.message.edit_text(
         text + "\n\n<i>Выбери номер пункта для редактирования:</i>",
         reply_markup=numbers_keyboard(result.items, "edit", category_id),
@@ -297,7 +289,6 @@ async def cb_item_edit_ask(
 
 @router.callback_query(F.data.startswith("item:edit_pick:"))
 async def cb_item_edit_pick(callback: CallbackQuery, state: FSMContext):
-    """Пользователь выбрал номер — просим ввести новый текст."""
     await callback.answer()
     item_id = int(callback.data.split(":")[2])
     await state.update_data(item_id=item_id)
@@ -311,41 +302,36 @@ async def handle_item_edit(
 ):
     data = await state.get_data()
     item_id = data["item_id"]
-
     new_text = message.text.strip()
+
     if not new_text or len(new_text) > 500:
         await message.answer("Текст должен быть от 1 до 500 символов. Попробуй ещё раз:")
         return
 
     list_service = ListService(session)
-    edit_result = await list_service.edit_item(user, item_id, new_text)
+    result = await list_service.edit_item(user, item_id, new_text)
     await state.clear()
 
-    if not edit_result.success:
-        await message.answer(edit_result.message)
+    if not result.success:
+        await message.answer(result.message)
         return
 
-    await _show_category(
-        message, user, session, edit_result.item.category_id, prefix="✅ Изменено!"
-    )
+    await _show_node(message, user, session, result.item.category_id, prefix="✅ Изменено!")
 
 
-# ── Удаление: выбор пункта ────────────────────────────────────────────────────
+# ── Удаление пункта ───────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("item:delete_ask:"))
-async def cb_item_delete_ask(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
-    """Показываем пронумерованные кнопки — пользователь выбирает какой пункт удалить."""
+async def cb_item_delete_ask(callback: CallbackQuery, user: User, session: AsyncSession):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
     list_service = ListService(session)
-    result = await list_service.get_items(user, category_id)
+    result = await list_service.get_node(user, category_id)
 
     if not result.success or not result.items:
         return
 
-    text = format_items_text(result.category, result.items)
+    text = format_node_text(result.breadcrumb, result.children, result.items)
     await callback.message.edit_text(
         text + "\n\n<i>Выбери номер пункта для удаления:</i>",
         reply_markup=numbers_keyboard(result.items, "delete", category_id),
@@ -354,13 +340,9 @@ async def cb_item_delete_ask(
 
 
 @router.callback_query(F.data.startswith("item:delete_pick:"))
-async def cb_item_delete_pick(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
-    """Удаляем сразу по нажатию без доп. подтверждения."""
+async def cb_item_delete_pick(callback: CallbackQuery, user: User, session: AsyncSession):
     await callback.answer("Удалено")
     item_id = int(callback.data.split(":")[2])
-    list_service = ListService(session)
 
     from repositories import ListRepository
     item = await ListRepository(session).get_item(item_id)
@@ -368,16 +350,15 @@ async def cb_item_delete_pick(
         return
     category_id = item.category_id
 
+    list_service = ListService(session)
     await list_service.delete_item(user, item_id)
-    await _show_category(callback, user, session, category_id)
+    await _show_node(callback, user, session, category_id)
 
 
 # ── Очистка отмеченных ────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("item:clear:"))
-async def cb_items_clear(
-    callback: CallbackQuery, user: User, session: AsyncSession
-):
+async def cb_items_clear(callback: CallbackQuery, user: User, session: AsyncSession):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
     list_service = ListService(session)
@@ -387,4 +368,4 @@ async def cb_items_clear(
         await callback.answer(result.message, show_alert=True)
         return
 
-    await _show_category(callback, user, session, category_id, prefix=f"🧹 {result.message}")
+    await _show_node(callback, user, session, category_id, prefix=f"🧹 {result.message}")

@@ -1,10 +1,5 @@
 """
 handlers/keyboards.py — все инлайн-клавиатуры бота.
-
-Новый подход к отображению списков:
-  - Содержимое списка рендерится в ТЕКСТЕ сообщения (полный текст, без обрезки)
-  - Кнопки — только для действий: toggle по номеру, добавить, редактировать, удалить
-  - Это стандартный паттерн для Telegram-ботов со списками
 """
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,71 +7,94 @@ from db.models import ListCategory, ListItem
 
 
 def categories_keyboard(categories: list[ListCategory]) -> InlineKeyboardMarkup:
-    """Список категорий — каждая кнопка открывает категорию."""
+    """Главное меню — корневые категории."""
     buttons = []
     for cat in categories:
         title = f"{cat.emoji} {cat.name}" if cat.emoji else cat.name
         buttons.append([
-            InlineKeyboardButton(
-                text=title,
-                callback_data=f"cat:open:{cat.id}",
-            )
+            InlineKeyboardButton(text=title, callback_data=f"cat:open:{cat.id}")
         ])
     buttons.append([
-        InlineKeyboardButton(text="＋ Новая категория", callback_data="cat:new"),
+        InlineKeyboardButton(text="＋ Новый раздел", callback_data="cat:new:root"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def format_items_text(category: ListCategory, items: list[ListItem]) -> str:
+def format_node_text(
+    breadcrumb: list[ListCategory],
+    children: list[ListCategory],
+    items: list[ListItem],
+) -> str:
     """
-    Форматирует содержимое категории как текст сообщения.
-    Список живёт здесь — не в кнопках — поэтому текст не обрезается.
+    Формирует текст сообщения для одного узла дерева.
+
+    Заголовок — хлебные крошки: 🎬 Фильмы › Фантастика › Фэнтези
+    Тело — сначала дочерние папки 📁, потом пронумерованные пункты.
     """
-    title = f"{category.emoji} {category.name}" if category.emoji else category.name
-    checked_count = sum(1 for i in items if i.is_checked)
-    n = len(items)
+    # Заголовок с breadcrumb
+    parts = []
+    for cat in breadcrumb:
+        parts.append(f"{cat.emoji} {cat.name}" if cat.emoji else cat.name)
+    header = " › ".join(parts)
 
-    # Русское склонение
-    if n % 10 == 1 and n % 100 != 11:
-        noun = "пункт"
-    elif 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
-        noun = "пункта"
-    else:
-        noun = "пунктов"
+    lines = [f"<b>{header}</b>"]
 
-    header = f"<b>{title}</b>"
+    # Счётчики
+    info_parts = []
+    if children:
+        info_parts.append(f"📁 {len(children)}")
     if items:
-        header += f"  <i>({n} {noun}"
-        if checked_count:
-            header += f", отмечено: {checked_count}"
-        header += ")</i>"
+        checked = sum(1 for i in items if i.is_checked)
+        info_parts.append(f"☐ {len(items)}" + (f"  ✅ {checked}" if checked else ""))
+    if info_parts:
+        lines.append(f"<i>{' · '.join(info_parts)}</i>")
 
-    if not items:
-        return header + "\n\n<i>Список пуст. Нажми + Добавить</i>"
+    lines.append("")  # пустая строка-разделитель
 
-    lines = []
+    # Дочерние разделы
+    for child in children:
+        title = f"{child.emoji} {child.name}" if child.emoji else child.name
+        lines.append(f"📁  {title}")
+
+    # Пункты списка
     for i, item in enumerate(items, 1):
         icon = "✅" if item.is_checked else "☐"
         lines.append(f"{icon}  <b>{i}.</b>  {item.text}")
 
-    return header + "\n\n" + "\n".join(lines)
+    if not children and not items:
+        lines.append("<i>Пусто. Добавь раздел или пункт.</i>")
+
+    return "\n".join(lines)
 
 
-def category_keyboard(
+def node_keyboard(
     category: ListCategory,
+    children: list[ListCategory],
     items: list[ListItem],
 ) -> InlineKeyboardMarkup:
     """
-    Клавиатура категории.
+    Клавиатура узла дерева.
 
-    Верхние ряды — кнопки с номерами для быстрого toggle (отметить/снять).
-    По 5 кнопок в ряд.
-    Нижние ряды — добавить, редактировать, удалить, назад.
+    Ряд 1: кнопки-папки для перехода в дочерние разделы
+    Ряд 2: числа для toggle пунктов (по 5 в ряд)
+    Ряд 3: + Добавить пункт | + Добавить раздел
+    Ряд 4: ✏️ Редактировать | 🗑 Удалить пункт  (если есть пункты)
+    Ряд 5: 🧹 Очистить отмеченные              (если есть отмеченные)
+    Ряд 6: 🗑 Удалить раздел | ‹ Назад
     """
     buttons = []
 
-    # Ряды с номерами для toggle
+    # Кнопки дочерних разделов
+    for child in children:
+        title = f"{child.emoji} {child.name}" if child.emoji else child.name
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📁 {title}",
+                callback_data=f"cat:open:{child.id}",
+            )
+        ])
+
+    # Числа для toggle пунктов
     if items:
         row = []
         for i, item in enumerate(items, 1):
@@ -91,12 +109,13 @@ def category_keyboard(
         if row:
             buttons.append(row)
 
-    # Добавить
+    # Добавить пункт / добавить раздел
     buttons.append([
-        InlineKeyboardButton(text="＋ Добавить", callback_data=f"item:new:{category.id}"),
+        InlineKeyboardButton(text="＋ Пункт", callback_data=f"item:new:{category.id}"),
+        InlineKeyboardButton(text="＋ Раздел", callback_data=f"cat:new:{category.id}"),
     ])
 
-    # Редактировать и удалить пункт
+    # Редактировать / удалить пункт
     if items:
         buttons.append([
             InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"item:edit_ask:{category.id}"),
@@ -105,48 +124,38 @@ def category_keyboard(
         if any(i.is_checked for i in items):
             buttons.append([
                 InlineKeyboardButton(
-                    text="🧹 Удалить отмеченные пункты",
+                    text="🧹 Очистить отмеченные",
                     callback_data=f"item:clear:{category.id}",
                 )
             ])
 
+    # Назад и удалить раздел
+    parent = category.parent_id
+    back_cb = f"cat:open:{parent}" if parent else "cat:list"
     buttons.append([
-        InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"cat:delete:{category.id}"),
-        InlineKeyboardButton(text="‹ Назад", callback_data="cat:list"),
+        InlineKeyboardButton(text="🗑 Удалить раздел", callback_data=f"cat:delete:{category.id}"),
+        InlineKeyboardButton(text="‹ Назад", callback_data=back_cb),
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def confirm_keyboard(action: str, target_id: int) -> InlineKeyboardMarkup:
-    """Универсальное подтверждение опасных действий."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="✅ Да, удалить",
-                callback_data=f"{action}:confirm:{target_id}",
-            ),
-            InlineKeyboardButton(
-                text="✗ Отмена",
-                callback_data=f"{action}:cancel:{target_id}",
-            ),
-        ]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data=f"{action}:confirm:{target_id}"),
+        InlineKeyboardButton(text="✗ Отмена", callback_data=f"{action}:cancel:{target_id}"),
+    ]])
 
 
 def back_keyboard(callback_data: str, text: str = "‹ Назад") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text, callback_data=callback_data)]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data=callback_data)
+    ]])
 
 
 def numbers_keyboard(
     items: list[ListItem], action: str, category_id: int
 ) -> InlineKeyboardMarkup:
-    """
-    Клавиатура выбора пункта по номеру (для редактирования/удаления).
-    action: 'edit' или 'delete'
-    """
     buttons = []
     row = []
     for i, item in enumerate(items, 1):
@@ -159,7 +168,6 @@ def numbers_keyboard(
             row = []
     if row:
         buttons.append(row)
-
     buttons.append([
         InlineKeyboardButton(text="✗ Отмена", callback_data=f"cat:open:{category_id}"),
     ])

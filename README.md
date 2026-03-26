@@ -11,7 +11,7 @@ pip install -r requirements.txt
 
 ### 2. Настройка
 ```bash
-cp .env .env
+cp .env.example .env
 ```
 Открой `.env` и заполни:
 - `BOT_TOKEN` — токен от @BotFather

@@ -1,11 +1,14 @@
 """
-services/list_service.py — бизнес-логика для списков.
+services/list_service.py — бизнес-логика для списков с поддержкой иерархии.
 
-Здесь проверяем что пользователь имеет право на операцию
-(принадлежит ли категория его семье), и координируем работу репозитория.
+Ключевые изменения:
+  - get_categories() → get_root_categories() для главного меню
+  - get_node() — открыть конкретный узел (подкатегории + пункты + breadcrumb)
+  - create_subcategory() — создать вложенную категорию
+  - Проверка доступа теперь идёт через family_id узла
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import ListCategory, ListItem, User
 from repositories import ListRepository
@@ -17,8 +20,10 @@ class ListServiceResult:
     message: str = ""
     category: ListCategory | None = None
     item: ListItem | None = None
-    items: list[ListItem] | None = None
-    categories: list[ListCategory] | None = None
+    items: list[ListItem] = field(default_factory=list)
+    categories: list[ListCategory] = field(default_factory=list)
+    children: list[ListCategory] = field(default_factory=list)
+    breadcrumb: list[ListCategory] = field(default_factory=list)
 
 
 class ListService:
@@ -26,117 +31,134 @@ class ListService:
         self.list_repo = ListRepository(session)
         self.session = session
 
-    def _format_category_title(self, category: ListCategory) -> str:
-        """Красиво форматирует название категории: '🛒 Продукты'."""
-        if category.emoji:
-            return f"{category.emoji} {category.name}"
-        return category.name
-
-    async def _check_category_access(
+    async def _check_access(
         self, category_id: int, family_id: int
     ) -> ListCategory | None:
-        """
-        Проверить что категория принадлежит семье пользователя.
-        Это защита от ситуации когда кто-то перебирает ID и пытается
-        получить доступ к чужим данным.
-        """
-        category = await self.list_repo.get_category(category_id)
-        if not category or category.family_id != family_id:
+        """Проверяет что категория принадлежит семье пользователя."""
+        cat = await self.list_repo.get_category(category_id)
+        if not cat or cat.family_id != family_id:
             return None
-        return category
+        return cat
 
-    # ── Категории ─────────────────────────────────────────────────────────
+    # ── Корневые категории (главное меню) ──────────────────────────────────
 
-    async def get_categories(self, user: User) -> ListServiceResult:
-        """Получить все категории семьи пользователя."""
+    async def get_root_categories(self, user: User) -> ListServiceResult:
         if not user.family_id:
             return ListServiceResult(
                 success=False,
                 message="Сначала создай группу или вступи в неё (/family).",
             )
-        categories = await self.list_repo.get_categories(user.family_id)
+        categories = await self.list_repo.get_root_categories(user.family_id)
         return ListServiceResult(success=True, categories=categories)
 
-    async def create_category(
+    # ── Открыть узел (подкатегории + пункты + хлебные крошки) ─────────────
+
+    async def get_node(self, user: User, category_id: int) -> ListServiceResult:
+        """
+        Загружает всё необходимое для отображения одного узла дерева:
+          - breadcrumb: путь от корня (для заголовка)
+          - children: дочерние категории (показываем папками 📁)
+          - items: пункты этого узла (показываем списком)
+        """
+        if not user.family_id:
+            return ListServiceResult(success=False, message="Нет доступа.")
+
+        category = await self._check_access(category_id, user.family_id)
+        if not category:
+            return ListServiceResult(success=False, message="Категория не найдена.")
+
+        children = await self.list_repo.get_children(category_id)
+        items = await self.list_repo.get_items(category_id)
+        breadcrumb = await self.list_repo.get_breadcrumb(category_id)
+
+        return ListServiceResult(
+            success=True,
+            category=category,
+            children=children,
+            items=items,
+            breadcrumb=breadcrumb,
+        )
+
+    # ── Создание категорий ─────────────────────────────────────────────────
+
+    async def create_root_category(
         self, user: User, name: str, emoji: str | None = None
     ) -> ListServiceResult:
-        """Создать новую категорию списков."""
+        """Создать корневую категорию (parent_id = NULL)."""
         if not user.family_id:
             return ListServiceResult(
                 success=False,
                 message="Сначала создай группу или вступи в неё (/family).",
             )
-
-        # Очищаем эмодзи — берём только первый символ если передали строку
         if emoji:
-            emoji = emoji.strip()[:2]  # эмодзи могут быть 2 байта
+            emoji = emoji.strip()[:2]
 
         category = await self.list_repo.create_category(
             family_id=user.family_id,
             created_by=user.id,
             name=name.strip(),
             emoji=emoji,
+            parent_id=None,
         )
         await self.session.commit()
+        return ListServiceResult(success=True, category=category)
 
-        return ListServiceResult(
-            success=True,
-            message=f"Категория {self._format_category_title(category)} создана!",
-            category=category,
+    async def create_subcategory(
+        self, user: User, parent_id: int, name: str, emoji: str | None = None
+    ) -> ListServiceResult:
+        """Создать вложенную категорию внутри существующей."""
+        if not user.family_id:
+            return ListServiceResult(success=False, message="Нет доступа.")
+
+        parent = await self._check_access(parent_id, user.family_id)
+        if not parent:
+            return ListServiceResult(success=False, message="Родительская категория не найдена.")
+
+        if emoji:
+            emoji = emoji.strip()[:2]
+
+        category = await self.list_repo.create_category(
+            family_id=user.family_id,
+            created_by=user.id,
+            name=name.strip(),
+            emoji=emoji,
+            parent_id=parent_id,
         )
+        await self.session.commit()
+        return ListServiceResult(success=True, category=category)
 
     async def delete_category(
         self, user: User, category_id: int
     ) -> ListServiceResult:
-        """Удалить категорию вместе со всеми её пунктами."""
+        """Удалить категорию и все её содержимое (дочерние + пункты)."""
         if not user.family_id:
             return ListServiceResult(success=False, message="Нет доступа.")
 
-        category = await self._check_category_access(category_id, user.family_id)
+        category = await self._check_access(category_id, user.family_id)
         if not category:
-            return ListServiceResult(
-                success=False, message="Категория не найдена."
-            )
+            return ListServiceResult(success=False, message="Категория не найдена.")
 
-        title = self._format_category_title(category)
+        parent_id = category.parent_id  # запомним до удаления — вернёмся туда
         await self.list_repo.delete_category(category_id)
         await self.session.commit()
 
         return ListServiceResult(
             success=True,
-            message=f"Категория «{title}» и все её пункты удалены.",
+            message="Удалено.",
+            # передаём parent_id чтобы хендлер знал куда вернуться
+            category=ListCategory(id=parent_id) if parent_id else None,
         )
 
-    # ── Пункты списка ──────────────────────────────────────────────────────
-
-    async def get_items(
-        self, user: User, category_id: int
-    ) -> ListServiceResult:
-        """Получить все пункты категории."""
-        if not user.family_id:
-            return ListServiceResult(success=False, message="Нет доступа.")
-
-        category = await self._check_category_access(category_id, user.family_id)
-        if not category:
-            return ListServiceResult(
-                success=False, message="Категория не найдена."
-            )
-
-        items = await self.list_repo.get_items(category_id)
-        return ListServiceResult(success=True, category=category, items=items)
+    # ── Пункты ────────────────────────────────────────────────────────────
 
     async def add_item(
         self, user: User, category_id: int, text: str
     ) -> ListServiceResult:
-        """Добавить пункт в список."""
         if not user.family_id:
             return ListServiceResult(success=False, message="Нет доступа.")
 
-        category = await self._check_category_access(category_id, user.family_id)
-        if not category:
-            return ListServiceResult(
-                success=False, message="Категория не найдена."
-            )
+        if not await self._check_access(category_id, user.family_id):
+            return ListServiceResult(success=False, message="Категория не найдена.")
 
         item = await self.list_repo.create_item(
             category_id=category_id,
@@ -144,17 +166,11 @@ class ListService:
             text=text.strip(),
         )
         await self.session.commit()
-
-        return ListServiceResult(
-            success=True,
-            message=f"Добавлено: {item.text}",
-            item=item,
-        )
+        return ListServiceResult(success=True, item=item)
 
     async def edit_item(
         self, user: User, item_id: int, new_text: str
     ) -> ListServiceResult:
-        """Изменить текст пункта."""
         if not user.family_id:
             return ListServiceResult(success=False, message="Нет доступа.")
 
@@ -162,24 +178,16 @@ class ListService:
         if not item:
             return ListServiceResult(success=False, message="Пункт не найден.")
 
-        # Проверяем доступ через родительскую категорию
-        category = await self._check_category_access(item.category_id, user.family_id)
-        if not category:
+        if not await self._check_access(item.category_id, user.family_id):
             return ListServiceResult(success=False, message="Нет доступа.")
 
         item = await self.list_repo.update_item_text(item_id, new_text.strip())
         await self.session.commit()
-
-        return ListServiceResult(
-            success=True,
-            message=f"Пункт изменён: {item.text}",
-            item=item,
-        )
+        return ListServiceResult(success=True, item=item)
 
     async def toggle_item(
         self, user: User, item_id: int
     ) -> ListServiceResult:
-        """Отметить/снять отметку с пункта."""
         if not user.family_id:
             return ListServiceResult(success=False, message="Нет доступа.")
 
@@ -187,19 +195,16 @@ class ListService:
         if not item:
             return ListServiceResult(success=False, message="Пункт не найден.")
 
-        category = await self._check_category_access(item.category_id, user.family_id)
-        if not category:
+        if not await self._check_access(item.category_id, user.family_id):
             return ListServiceResult(success=False, message="Нет доступа.")
 
         item = await self.list_repo.toggle_item(item_id)
         await self.session.commit()
-
         return ListServiceResult(success=True, item=item)
 
     async def delete_item(
         self, user: User, item_id: int
     ) -> ListServiceResult:
-        """Удалить пункт из списка."""
         if not user.family_id:
             return ListServiceResult(success=False, message="Нет доступа.")
 
@@ -207,30 +212,23 @@ class ListService:
         if not item:
             return ListServiceResult(success=False, message="Пункт не найден.")
 
-        category = await self._check_category_access(item.category_id, user.family_id)
-        if not category:
+        category_id = item.category_id
+        if not await self._check_access(category_id, user.family_id):
             return ListServiceResult(success=False, message="Нет доступа.")
 
         await self.list_repo.delete_item(item_id)
         await self.session.commit()
-
-        return ListServiceResult(success=True, message="Пункт удалён.")
+        return ListServiceResult(success=True)
 
     async def clear_checked(
         self, user: User, category_id: int
     ) -> ListServiceResult:
-        """Удалить все отмеченные пункты (например, куплено в магазине)."""
         if not user.family_id:
             return ListServiceResult(success=False, message="Нет доступа.")
 
-        category = await self._check_category_access(category_id, user.family_id)
-        if not category:
+        if not await self._check_access(category_id, user.family_id):
             return ListServiceResult(success=False, message="Категория не найдена.")
 
         count = await self.list_repo.clear_checked_items(category_id)
         await self.session.commit()
-
-        return ListServiceResult(
-            success=True,
-            message=f"Удалено отмеченных пунктов: {count}",
-        )
+        return ListServiceResult(success=True, message=f"Удалено отмеченных: {count}")
