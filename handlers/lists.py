@@ -1,15 +1,12 @@
 """
-handlers/lists.py — хендлеры для работы со списками (с поддержкой иерархии).
+handlers/lists.py — хендлеры для работы со списками.
 
-Навигация:
-  /lists                 → корневые категории
-  cat:open:{id}          → открыть узел (папки + пункты)
-  cat:new:root           → создать корневую категорию
-  cat:new:{parent_id}    → создать вложенную категорию
-  cat:list               → вернуться к корневым категориям
+Изменения: добавлены уведомления через NotificationService.
+Хендлер получает bot: Bot как параметр — aiogram 3 инжектирует его
+автоматически, так же как session и user.
 """
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,7 +14,7 @@ from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import User
-from services import ListService
+from services import ListService, NotificationService
 from handlers.keyboards import (
     categories_keyboard,
     node_keyboard,
@@ -31,15 +28,14 @@ router = Router()
 
 
 class ListStates(StatesGroup):
-    waiting_for_category_name = State()  # данные: parent_id (None = корень)
-    waiting_for_item_text = State()      # данные: category_id
-    waiting_for_item_edit = State()      # данные: item_id
+    waiting_for_category_name = State()
+    waiting_for_item_text = State()
+    waiting_for_item_edit = State()
 
 
-# ── Вспомогательная функция ───────────────────────────────────────────────────
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 async def _show_node(target, user: User, session: AsyncSession, category_id: int, prefix: str = ""):
-    """Показывает/обновляет содержимое узла дерева."""
     list_service = ListService(session)
     result = await list_service.get_node(user, category_id)
 
@@ -62,7 +58,6 @@ async def _show_node(target, user: User, session: AsyncSession, category_id: int
 
 
 async def _show_root(target, user: User, session: AsyncSession, prefix: str = ""):
-    """Показывает главное меню со списком корневых категорий."""
     list_service = ListService(session)
     result = await list_service.get_root_categories(user)
 
@@ -95,8 +90,6 @@ async def cb_root(callback: CallbackQuery, user: User, session: AsyncSession):
     await _show_root(callback, user, session)
 
 
-# ── Открыть узел ──────────────────────────────────────────────────────────────
-
 @router.callback_query(F.data.startswith("cat:open:"))
 async def cb_node_open(callback: CallbackQuery, user: User, session: AsyncSession):
     await callback.answer()
@@ -108,14 +101,9 @@ async def cb_node_open(callback: CallbackQuery, user: User, session: AsyncSessio
 
 @router.callback_query(F.data.startswith("cat:new:"))
 async def cb_category_new(callback: CallbackQuery, state: FSMContext):
-    """
-    cat:new:root      → создаём корневую
-    cat:new:{int}     → создаём дочернюю внутри {int}
-    """
     await callback.answer()
     raw = callback.data.split(":")[2]
     parent_id = None if raw == "root" else int(raw)
-
     await state.update_data(parent_id=parent_id)
 
     if parent_id:
@@ -131,14 +119,13 @@ async def cb_category_new(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ListStates.waiting_for_category_name)
 async def handle_category_name(
-    message: Message, state: FSMContext, user: User, session: AsyncSession
+    message: Message, state: FSMContext, user: User, session: AsyncSession, bot: Bot
 ):
     text = message.text.strip()
     if not text or len(text) > 60:
         await message.answer("Название должно быть от 1 до 60 символов. Попробуй ещё раз:")
         return
 
-    # Парсим эмодзи из начала строки
     emoji, name = None, text
     if text and not text[0].isalnum() and not text[0].isspace():
         parts = text.split(maxsplit=1)
@@ -159,7 +146,10 @@ async def handle_category_name(
         await message.answer(result.message)
         return
 
-    # После создания возвращаемся туда откуда пришли
+    # Уведомляем партнёра
+    notif = NotificationService(bot, session)
+    await notif.category_created(user, result.category)
+
     if parent_id:
         await _show_node(message, user, session, parent_id, prefix="✅ Раздел создан!")
     else:
@@ -182,15 +172,16 @@ async def cb_category_delete(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cat_del:confirm:"))
 async def cb_category_delete_confirm(
-    callback: CallbackQuery, user: User, session: AsyncSession
+    callback: CallbackQuery, user: User, session: AsyncSession, bot: Bot
 ):
     await callback.answer()
     category_id = int(callback.data.split(":")[2])
 
-    # Запомним parent_id ДО удаления
     from repositories import ListRepository
     cat = await ListRepository(session).get_category(category_id)
     parent_id = cat.parent_id if cat else None
+    # Запоминаем название ДО удаления — после удаления объект недоступен
+    cat_title = f"{cat.emoji} {cat.name}" if cat and cat.emoji else (cat.name if cat else "")
 
     list_service = ListService(session)
     result = await list_service.delete_category(user, category_id)
@@ -199,7 +190,10 @@ async def cb_category_delete_confirm(
         await callback.message.edit_text(result.message)
         return
 
-    # Возвращаемся к родителю или в корень
+    # Уведомляем партнёра
+    notif = NotificationService(bot, session)
+    await notif.category_deleted(user, cat_title)
+
     if parent_id:
         await _show_node(callback, user, session, parent_id, prefix="✅ Удалено.")
     else:
@@ -231,7 +225,7 @@ async def cb_item_new(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ListStates.waiting_for_item_text)
 async def handle_item_text(
-    message: Message, state: FSMContext, user: User, session: AsyncSession
+    message: Message, state: FSMContext, user: User, session: AsyncSession, bot: Bot
 ):
     data = await state.get_data()
     category_id = data["category_id"]
@@ -249,13 +243,21 @@ async def handle_item_text(
         await message.answer(result.message)
         return
 
+    # Получаем категорию для уведомления
+    from repositories import ListRepository
+    category = await ListRepository(session).get_category(category_id)
+    notif = NotificationService(bot, session)
+    await notif.item_added(user, result.item, category)
+
     await _show_node(message, user, session, category_id, prefix="✅ Добавлено!")
 
 
 # ── Toggle ────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("item:toggle:"))
-async def cb_item_toggle(callback: CallbackQuery, user: User, session: AsyncSession):
+async def cb_item_toggle(
+    callback: CallbackQuery, user: User, session: AsyncSession, bot: Bot
+):
     await callback.answer()
     item_id = int(callback.data.split(":")[2])
     list_service = ListService(session)
@@ -263,6 +265,12 @@ async def cb_item_toggle(callback: CallbackQuery, user: User, session: AsyncSess
 
     if not result.success:
         return
+
+    # Уведомляем — но только если это не сам пользователь в одиночку
+    from repositories import ListRepository
+    category = await ListRepository(session).get_category(result.item.category_id)
+    notif = NotificationService(bot, session)
+    await notif.item_checked(user, result.item, category)
 
     await _show_node(callback, user, session, result.item.category_id)
 
@@ -288,20 +296,24 @@ async def cb_item_edit_ask(callback: CallbackQuery, user: User, session: AsyncSe
 
 
 @router.callback_query(F.data.startswith("item:edit_pick:"))
-async def cb_item_edit_pick(callback: CallbackQuery, state: FSMContext):
+async def cb_item_edit_pick(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     await callback.answer()
     item_id = int(callback.data.split(":")[2])
-    await state.update_data(item_id=item_id)
+    # Сохраняем старый текст в FSM — понадобится для уведомления
+    from repositories import ListRepository
+    item = await ListRepository(session).get_item(item_id)
+    await state.update_data(item_id=item_id, old_text=item.text if item else "")
     await callback.message.edit_text("Введи новый текст для пункта:")
     await state.set_state(ListStates.waiting_for_item_edit)
 
 
 @router.message(ListStates.waiting_for_item_edit)
 async def handle_item_edit(
-    message: Message, state: FSMContext, user: User, session: AsyncSession
+    message: Message, state: FSMContext, user: User, session: AsyncSession, bot: Bot
 ):
     data = await state.get_data()
     item_id = data["item_id"]
+    old_text = data.get("old_text", "")
     new_text = message.text.strip()
 
     if not new_text or len(new_text) > 500:
@@ -315,6 +327,11 @@ async def handle_item_edit(
     if not result.success:
         await message.answer(result.message)
         return
+
+    from repositories import ListRepository
+    category = await ListRepository(session).get_category(result.item.category_id)
+    notif = NotificationService(bot, session)
+    await notif.item_edited(user, result.item, category, old_text)
 
     await _show_node(message, user, session, result.item.category_id, prefix="✅ Изменено!")
 
@@ -340,18 +357,27 @@ async def cb_item_delete_ask(callback: CallbackQuery, user: User, session: Async
 
 
 @router.callback_query(F.data.startswith("item:delete_pick:"))
-async def cb_item_delete_pick(callback: CallbackQuery, user: User, session: AsyncSession):
+async def cb_item_delete_pick(
+    callback: CallbackQuery, user: User, session: AsyncSession, bot: Bot
+):
     await callback.answer("Удалено")
     item_id = int(callback.data.split(":")[2])
 
     from repositories import ListRepository
-    item = await ListRepository(session).get_item(item_id)
+    list_repo = ListRepository(session)
+    item = await list_repo.get_item(item_id)
     if not item:
         return
     category_id = item.category_id
+    item_text = item.text  # запоминаем до удаления
+    category = await list_repo.get_category(category_id)
 
     list_service = ListService(session)
     await list_service.delete_item(user, item_id)
+
+    notif = NotificationService(bot, session)
+    await notif.item_deleted(user, item_text, category)
+
     await _show_node(callback, user, session, category_id)
 
 

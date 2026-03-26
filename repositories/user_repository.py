@@ -52,6 +52,13 @@ class UserRepository:
         await self.session.flush()
         return user
 
+    async def get_family_members(self, family_id: int) -> list[User]:
+        """Все участники семьи."""
+        result = await self.session.execute(
+            select(User).where(User.family_id == family_id)
+        )
+        return list(result.scalars().all())
+
     async def update_family(self, user_id: int, family_id: int) -> User | None:
         """Привязать пользователя к семье."""
         user = await self.get_by_id(user_id)

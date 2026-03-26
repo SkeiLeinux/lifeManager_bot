@@ -72,7 +72,6 @@ async def cmd_help(message: Message):
 async def cmd_family(message: Message, user: User, session: AsyncSession):
     """Показывает статус группы и варианты действий."""
     if user.family_id:
-        user_service = UserService(session)
         from repositories import FamilyRepository
         family_repo = FamilyRepository(session)
         family = await family_repo.get_by_id(user.family_id)
