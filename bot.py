@@ -62,11 +62,16 @@ async def main():
                 data["session"] = session
                 return await handler(event, data)
 
-    # Порядок регистрации middleware важен:
-    # SessionMiddleware должна быть первой — она создаёт сессию,
-    # AuthMiddleware использует её чтобы найти/создать пользователя.
-    dp.update.middleware(SessionMiddleware())
-    dp.update.middleware(AuthMiddleware())
+    # Порядок регистрации важен: Session сначала (создаёт сессию),
+    # Auth следом (использует сессию чтобы найти/создать пользователя).
+    #
+    # ВАЖНО: регистрируем на конкретных обсерверах (message, callback_query),
+    # а НЕ на dp.update. Если вешать на dp.update — в event приходит объект
+    # Update (обёртка), а не Message/CallbackQuery, и isinstance-проверки
+    # в AuthMiddleware не срабатывают → data["user"] не устанавливается.
+    for observer in (dp.message, dp.callback_query):
+        observer.middleware(SessionMiddleware())
+        observer.middleware(AuthMiddleware())
 
     # Регистрируем роутеры — они содержат хендлеры команд и callback-ов.
     # common сначала: там /start и /help
