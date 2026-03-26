@@ -7,12 +7,14 @@ bot.py — точка входа.
 """
 
 import asyncio
+import html
 import logging
+import traceback
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import TelegramObject
+from aiogram.types import TelegramObject, ErrorEvent
 from typing import Any, Callable, Awaitable
 
 from config import settings
@@ -28,18 +30,27 @@ logger = logging.getLogger(__name__)
 
 
 def run_migrations():
-    """
-    Запускает alembic upgrade head синхронно.
-    Alembic не асинхронный, поэтому вызываем через subprocess —
-    это стандартный подход для запуска миграций при старте приложения.
-    """
     import subprocess, sys
+    from pathlib import Path
+
+    # Ищем alembic в том же venv что и текущий python.
+    # На Windows: .venv/Scripts/alembic.exe
+    # На Linux:   .venv/bin/alembic
+    python = Path(sys.executable)
+    venv_bin = python.parent
+    alembic = venv_bin / ("alembic.exe" if sys.platform == "win32" else "alembic")
+
+    # Если alembic не найден рядом с python — падаем с понятной ошибкой
+    if not alembic.exists():
+        logger.error(f"alembic not found at {alembic}. Run: pip install alembic")
+        raise RuntimeError("alembic not found in current venv")
+
     logger.info("Применяем миграции базы данных...")
     result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        [str(alembic), "upgrade", "head"],
         capture_output=True,
         text=True,
-        encoding="utf-8",  # явно указываем UTF-8 — иначе Windows использует cp1251
+        encoding="utf-8",
     )
     if result.returncode != 0:
         logger.error(f"Ошибка миграций:\n{result.stderr}")
@@ -73,6 +84,63 @@ async def main():
 
     dp.include_router(common.router)
     dp.include_router(lists.router)
+
+    # Error handler — ловит все необработанные исключения внутри хендлеров.
+    # Срабатывает когда в любом хендлере вылетело исключение которое никто не поймал.
+    @dp.error()
+    async def error_handler(event: ErrorEvent, bot: Bot) -> None:
+        """
+        ErrorEvent содержит:
+          event.exception — само исключение
+          event.update    — апдейт при обработке которого произошла ошибка
+        """
+        # Всегда логируем в systemd journal
+        logger.exception(f"Unhandled exception: {event.exception}", exc_info=event.exception)
+
+        # Если задан admin_telegram_id — отправляем уведомление в Telegram
+        if not settings.admin_telegram_id:
+            return
+
+        # Формируем читаемый трейсбек
+        tb = "".join(traceback.format_exception(
+            type(event.exception), event.exception, event.exception.__traceback__
+        ))
+        # html.escape экранирует < > & чтобы Telegram не сломал HTML-разметку
+        tb_escaped = html.escape(tb)
+
+        # Telegram ограничивает сообщения 4096 символами — обрезаем если длиннее
+        max_len = 3800
+        if len(tb_escaped) > max_len:
+            tb_escaped = tb_escaped[-max_len:]  # берём конец — там самое важное
+            tb_escaped = "...(обрезано)\n" + tb_escaped
+
+        # Информация об апдейте который вызвал ошибку
+        update_info = ""
+        if event.update.message:
+            u = event.update.message.from_user
+            update_info = f"От: {u.full_name} (@{u.username}) | Текст: {event.update.message.text}"
+        elif event.update.callback_query:
+            u = event.update.callback_query.from_user
+            update_info = f"От: {u.full_name} (@{u.username}) | Callback: {event.update.callback_query.data}"
+
+        text = (
+            f"🔴 <b>Ошибка в боте</b>\n\n"
+            f"<b>Тип:</b> {html.escape(type(event.exception).__name__)}\n"
+            f"<b>Сообщение:</b> {html.escape(str(event.exception))}\n"
+        )
+        if update_info:
+            text += f"<b>Контекст:</b> {html.escape(update_info)}\n"
+        text += f"\n<pre>{tb_escaped}</pre>"
+
+        try:
+            await bot.send_message(
+                chat_id=settings.admin_telegram_id,
+                text=text,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            # Если не удалось отправить уведомление — просто логируем
+            logger.error(f"Failed to send error notification: {e}")
 
     run_migrations()
 

@@ -5,9 +5,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     bot_token: str
     database_url: str
-    # Храним как строку — не как list[int] — иначе pydantic пытается
-    # парсить "123,456" как JSON и падает с JSONDecodeError
     allowed_user_ids_raw: str = ""
+    # Telegram ID администратора — сюда приходят уведомления об ошибках.
+    # Узнать свой ID можно у @userinfobot в Telegram.
+    admin_telegram_id: int | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
